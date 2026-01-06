@@ -4,9 +4,9 @@ package tun
 
 import (
 	"context"
-	"encoding/binary"
 	"io"
 	"net"
+	"net/netip"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -20,87 +20,44 @@ import (
 	"github.com/xtls/xray-core/transport"
 )
 
-const (
-	// IP header lengths
-	ipv4MinHeaderLen = 20
-	ipv6HeaderLen    = 40
+// SystemStack implements a system-based TCP/IP stack for iOS
+// It uses NAT and a local TCP listener to handle connections through the system TCP stack
+type SystemStack struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	// Transport header lengths
-	tcpMinHeaderLen = 20
-	udpHeaderLen    = 8
+	tun     *IOSTun
+	handler *Handler
 
-	// IP protocols
-	protoICMP   = 1
-	protoTCP    = 6
-	protoUDP    = 17
-	protoICMPv6 = 58
+	// TUN addresses
+	inet4Addr netip.Addr // TUN interface address (e.g., 10.0.0.1)
+	inet4Next netip.Addr // NAT source address (e.g., 10.0.0.2)
+	inet6Addr netip.Addr
+	inet6Next netip.Addr
 
-	// TCP flags
-	tcpFlagSYN = 0x02
-	tcpFlagACK = 0x10
-	tcpFlagFIN = 0x01
-	tcpFlagRST = 0x04
-)
+	// TCP NAT and listener
+	tcpNat       *TCPNat
+	tcpListener  net.Listener
+	tcpListener6 net.Listener
+	tcpPort      uint16
+	tcpPort6     uint16
 
-// tcpSessionKey uniquely identifies a TCP connection (5-tuple)
-type tcpSessionKey struct {
-	srcIP   [16]byte
-	dstIP   [16]byte
-	srcPort uint16
-	dstPort uint16
-	isIPv6  bool
-}
+	// UDP NAT
+	udpNat *UDPNat
 
-// tcpSession represents an active TCP session
-type tcpSession struct {
-	key        tcpSessionKey
-	conn       net.Conn
-	reader     *buf.BufferedReader
-	writer     buf.Writer
-	lastActive time.Time
-	closed     bool
-	mu         sync.Mutex
-}
-
-// udpSessionKey uniquely identifies a UDP session
-type udpSessionKey struct {
-	srcIP   [16]byte
-	dstIP   [16]byte
-	srcPort uint16
-	dstPort uint16
-	isIPv6  bool
-}
-
-// udpSession represents an active UDP session
-type udpSession struct {
-	key        udpSessionKey
-	conn       net.Conn
-	lastActive time.Time
-}
-
-// LightweightStack is a memory-efficient TCP/IP stack for iOS
-// It parses IP packets and creates connections via system TCP/UDP stack
-type LightweightStack struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	tun         *IOSTun
-	handler     *Handler
-	idleTimeout time.Duration
-
-	tcpSessions sync.Map // map[tcpSessionKey]*tcpSession
-	udpSessions sync.Map // map[udpSessionKey]*udpSession
-
+	// Synchronization
 	wg     sync.WaitGroup
 	closed bool
 	mu     sync.Mutex
 }
 
-// NewStack creates a new iOS lightweight stack
+// NewStack creates a new iOS system stack
 func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stack, error) {
-	iosTun, ok := options.Tun.(*IOSTun)
-	if !ok {
-		return nil, errors.New("expected IOSTun for iOS stack")
-	}
+	// Default TUN addresses
+	inet4Addr := netip.MustParseAddr("10.0.0.1")
+	inet4Next := netip.MustParseAddr("10.0.0.2")
+	inet6Addr := netip.MustParseAddr("fd00::1")
+	inet6Next := netip.MustParseAddr("fd00::2")
 
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -109,30 +66,66 @@ func NewStack(ctx context.Context, options StackOptions, handler *Handler) (Stac
 		idleTimeout = 5 * time.Minute
 	}
 
-	stack := &LightweightStack{
-		ctx:         ctx,
-		cancel:      cancel,
-		tun:         iosTun,
-		handler:     handler,
-		idleTimeout: idleTimeout,
+	iosTun, ok := options.Tun.(*IOSTun)
+	if !ok {
+		cancel()
+		return nil, errors.New("expected IOSTun for iOS stack")
 	}
 
-	errors.LogInfo(ctx, "iOS lightweight stack created")
+	stack := &SystemStack{
+		ctx:       ctx,
+		cancel:    cancel,
+		tun:       iosTun,
+		handler:   handler,
+		inet4Addr: inet4Addr,
+		inet4Next: inet4Next,
+		inet6Addr: inet6Addr,
+		inet6Next: inet6Next,
+		tcpNat:    NewTCPNat(ctx, idleTimeout),
+		udpNat:    NewUDPNat(ctx, idleTimeout),
+	}
+
+	errors.LogInfo(ctx, "iOS system stack created")
 	return stack, nil
 }
 
-// Start starts the packet processing loop
-func (s *LightweightStack) Start() error {
-	s.wg.Add(2)
-	go s.readLoop()
-	go s.cleanupLoop()
+// Start starts the system stack
+func (s *SystemStack) Start() error {
+	// Start IPv4 TCP listener
+	listener, err := net.Listen("tcp4", net.JoinHostPort(s.inet4Addr.String(), "0"))
+	if err != nil {
+		// If we can't bind to TUN address, try localhost
+		listener, err = net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			return errors.New("failed to start TCP listener: ", err)
+		}
+	}
+	s.tcpListener = listener
+	s.tcpPort = uint16(listener.Addr().(*net.TCPAddr).Port)
 
-	errors.LogInfo(s.ctx, "iOS lightweight stack started")
+	// Start IPv6 TCP listener (optional)
+	listener6, err := net.Listen("tcp6", net.JoinHostPort(s.inet6Addr.String(), "0"))
+	if err == nil {
+		s.tcpListener6 = listener6
+		s.tcpPort6 = uint16(listener6.Addr().(*net.TCPAddr).Port)
+	}
+
+	// Start goroutines
+	s.wg.Add(2)
+	go s.tunLoop()
+	go s.acceptLoop(s.tcpListener, false)
+
+	if s.tcpListener6 != nil {
+		s.wg.Add(1)
+		go s.acceptLoop(s.tcpListener6, true)
+	}
+
+	errors.LogInfo(s.ctx, "iOS system stack started, TCP port: ", s.tcpPort)
 	return nil
 }
 
-// Close stops the stack and cleans up resources
-func (s *LightweightStack) Close() error {
+// Close stops the system stack
+func (s *SystemStack) Close() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -143,35 +136,23 @@ func (s *LightweightStack) Close() error {
 
 	s.cancel()
 
-	// Close all TCP sessions
-	s.tcpSessions.Range(func(key, value interface{}) bool {
-		sess := value.(*tcpSession)
-		sess.mu.Lock()
-		if sess.conn != nil && !sess.closed {
-			sess.conn.Close()
-			sess.closed = true
-		}
-		sess.mu.Unlock()
-		return true
-	})
-
-	// Close all UDP sessions
-	s.udpSessions.Range(func(key, value interface{}) bool {
-		sess := value.(*udpSession)
-		if sess.conn != nil {
-			sess.conn.Close()
-		}
-		return true
-	})
+	if s.tcpListener != nil {
+		s.tcpListener.Close()
+	}
+	if s.tcpListener6 != nil {
+		s.tcpListener6.Close()
+	}
 
 	s.wg.Wait()
-	errors.LogInfo(s.ctx, "iOS lightweight stack closed")
+
+	errors.LogInfo(s.ctx, "iOS system stack closed")
 	return nil
 }
 
-// readLoop reads packets from TUN and processes them
-func (s *LightweightStack) readLoop() {
+// tunLoop reads packets from TUN and processes them
+func (s *SystemStack) tunLoop() {
 	defer s.wg.Done()
+	defer debug.FreeOSMemory()
 
 	for {
 		select {
@@ -184,333 +165,363 @@ func (s *LightweightStack) readLoop() {
 			return
 		}
 
-		data, ipVersion, err := s.tun.ReadPacket()
+		packet, proto, err := s.tun.ReadPacket()
 		if err != nil {
 			if err == io.EOF || s.tun.IsClosed() {
 				return
 			}
-			errors.LogWarning(s.ctx, "read packet error: ", err)
 			continue
 		}
 
-		if len(data) == 0 {
+		if len(packet) == 0 {
 			continue
 		}
 
-		// Process packet in current goroutine to save memory
-		// Only spawn goroutine for new TCP connections
-		s.processPacket(data, ipVersion)
+		// Process and possibly write back
+		if s.processPacket(packet, proto) {
+			s.tun.WritePacket(packet, proto)
+		}
 	}
 }
 
-// processPacket parses and handles an IP packet
-func (s *LightweightStack) processPacket(packet []byte, ipVersion int) {
-	var (
-		srcIP, dstIP net.IP
-		ipProto      uint8
-		payload      []byte
-		isIPv6       bool
-	)
+// processPacket processes an IP packet
+func (s *SystemStack) processPacket(packet []byte, proto int) bool {
+	version := IPVersion(packet)
 
-	// Parse IP header
-	if ipVersion == 4 || (len(packet) > 0 && packet[0]>>4 == 4) {
-		// IPv4
-		if len(packet) < ipv4MinHeaderLen {
-			return
-		}
-		headerLen := int(packet[0]&0x0f) * 4
-		if headerLen < ipv4MinHeaderLen || len(packet) < headerLen {
-			return
-		}
-		srcIP = net.IP(packet[12:16])
-		dstIP = net.IP(packet[16:20])
-		ipProto = packet[9]
-		payload = packet[headerLen:]
-		isIPv6 = false
-	} else if ipVersion == 6 || (len(packet) > 0 && packet[0]>>4 == 6) {
-		// IPv6
-		if len(packet) < ipv6HeaderLen {
-			return
-		}
-		srcIP = net.IP(packet[8:24])
-		dstIP = net.IP(packet[24:40])
-		ipProto = packet[6]
-		payload = packet[ipv6HeaderLen:]
-		isIPv6 = true
-	} else {
-		return
+	switch version {
+	case 4:
+		return s.processIPv4(packet)
+	case 6:
+		return s.processIPv6(packet)
 	}
 
-	// Handle transport layer
-	switch ipProto {
-	case protoTCP:
-		s.handleTCP(srcIP, dstIP, payload, isIPv6)
-	case protoUDP:
-		s.handleUDP(srcIP, dstIP, payload, isIPv6)
-	case protoICMP, protoICMPv6:
-		// Ignore ICMP for now
-	}
+	return false
 }
 
-// handleTCP processes TCP packets
-func (s *LightweightStack) handleTCP(srcIP, dstIP net.IP, tcpData []byte, isIPv6 bool) {
-	if len(tcpData) < tcpMinHeaderLen {
-		return
+// processIPv4 processes an IPv4 packet
+func (s *SystemStack) processIPv4(packet []byte) bool {
+	if len(packet) < IPv4MinHeaderSize {
+		return false
 	}
 
-	srcPort := binary.BigEndian.Uint16(tcpData[0:2])
-	dstPort := binary.BigEndian.Uint16(tcpData[2:4])
-	dataOffset := int(tcpData[12]>>4) * 4
-	flags := tcpData[13]
-
-	if dataOffset < tcpMinHeaderLen || len(tcpData) < dataOffset {
-		return
+	ipHdr := IPv4Header(packet)
+	headerLen := ipHdr.HeaderLength()
+	if len(packet) < headerLen {
+		return false
 	}
 
-	// Create session key
-	key := tcpSessionKey{
-		srcPort: srcPort,
-		dstPort: dstPort,
-		isIPv6:  isIPv6,
-	}
-	if isIPv6 {
-		copy(key.srcIP[:], srcIP.To16())
-		copy(key.dstIP[:], dstIP.To16())
-	} else {
-		copy(key.srcIP[:4], srcIP.To4())
-		copy(key.dstIP[:4], dstIP.To4())
+	payload := ipHdr.Payload()
+	if len(payload) == 0 {
+		return false
 	}
 
-	// Check for existing session
-	if sessVal, ok := s.tcpSessions.Load(key); ok {
-		sess := sessVal.(*tcpSession)
-		sess.mu.Lock()
-		sess.lastActive = time.Now()
+	switch ipHdr.Protocol() {
+	case ProtocolTCP:
+		return s.processTCPv4(ipHdr, TCPHeader(payload))
+	case ProtocolUDP:
+		s.processUDPv4(ipHdr, UDPHeader(payload))
+		return false
+	}
 
-		// Handle FIN/RST
-		if flags&(tcpFlagFIN|tcpFlagRST) != 0 {
-			if sess.conn != nil && !sess.closed {
-				sess.conn.Close()
-				sess.closed = true
-			}
-			sess.mu.Unlock()
-			s.tcpSessions.Delete(key)
-			return
+	return false
+}
+
+// processIPv6 processes an IPv6 packet
+func (s *SystemStack) processIPv6(packet []byte) bool {
+	if len(packet) < IPv6HeaderSize {
+		return false
+	}
+
+	ipHdr := IPv6Header(packet)
+	payload := ipHdr.Payload()
+	if len(payload) == 0 {
+		return false
+	}
+
+	switch ipHdr.NextHeader() {
+	case ProtocolTCP:
+		return s.processTCPv6(ipHdr, TCPHeader(payload))
+	case ProtocolUDP:
+		s.processUDPv6(ipHdr, UDPHeader(payload))
+		return false
+	}
+
+	return false
+}
+
+// processTCPv4 processes a TCP packet over IPv4
+func (s *SystemStack) processTCPv4(ipHdr IPv4Header, tcpHdr TCPHeader) bool {
+	if len(tcpHdr) < TCPMinHeaderSize {
+		return false
+	}
+
+	srcAddr := ipHdr.SourceAddr()
+	dstAddr := ipHdr.DestinationAddr()
+	srcPort := tcpHdr.SourcePort()
+	dstPort := tcpHdr.DestinationPort()
+
+	source := netip.AddrPortFrom(srcAddr, srcPort)
+	destination := netip.AddrPortFrom(dstAddr, dstPort)
+
+	// Check if this is a response from our local listener
+	if srcAddr == s.inet4Addr && srcPort == s.tcpPort {
+		// Reverse NAT: lookup original destination by NAT port
+		session := s.tcpNat.LookupBack(dstPort)
+		if session == nil {
+			return false
 		}
 
-		sess.mu.Unlock()
-		return
+		// Rewrite packet: src=original_dst, dst=original_src
+		ipHdr.SetSourceAddr(session.Destination.Addr())
+		tcpHdr.SetSourcePort(session.Destination.Port())
+		ipHdr.SetDestinationAddr(session.Source.Addr())
+		tcpHdr.SetDestinationPort(session.Source.Port())
+
+		// Recalculate checksums
+		s.recalcTCPv4Checksum(ipHdr, tcpHdr)
+		return true
 	}
 
-	// Only create new session on SYN
-	if flags&tcpFlagSYN == 0 {
-		return
+	// Handle FIN/RST - delete NAT entry
+	flags := tcpHdr.Flags()
+	if flags&(TCPFlagFIN|TCPFlagRST) != 0 {
+		s.tcpNat.Delete(source)
 	}
 
-	// Create new TCP session - dispatch to handler
-	dest := xnet.TCPDestination(xnet.IPAddress(dstIP), xnet.Port(dstPort))
+	// Outgoing packet - apply NAT
+	natPort, isNew := s.tcpNat.Lookup(source, destination)
 
-	// Create virtual connection for dispatcher
-	go s.handleNewTCPConnection(key, srcIP, srcPort, dest)
+	// Rewrite packet: src=inet4Next:natPort, dst=inet4Addr:tcpPort
+	ipHdr.SetSourceAddr(s.inet4Next)
+	tcpHdr.SetSourcePort(natPort)
+	ipHdr.SetDestinationAddr(s.inet4Addr)
+	tcpHdr.SetDestinationPort(s.tcpPort)
+
+	// Recalculate checksums
+	s.recalcTCPv4Checksum(ipHdr, tcpHdr)
+
+	if isNew {
+		errors.LogDebug(s.ctx, "TCP NAT: ", source, " -> ", destination, " (port ", natPort, ")")
+	}
+
+	return true
 }
 
-// handleNewTCPConnection creates a new TCP session and dispatches it
-func (s *LightweightStack) handleNewTCPConnection(key tcpSessionKey, srcIP net.IP, srcPort uint16, dest xnet.Destination) {
-	sid := session.NewID()
-	ctx := c.ContextWithID(s.ctx, sid)
-
-	// Setup inbound session
-	inbound := session.Inbound{
-		Name:          "tun-ios",
-		CanSpliceCopy: 1,
-		Source:        xnet.TCPDestination(xnet.IPAddress(srcIP), xnet.Port(srcPort)),
-		User: &protocol.MemoryUser{
-			Level: s.handler.config.UserLevel,
-		},
-	}
-	ctx = session.ContextWithInbound(ctx, &inbound)
-	ctx = session.SubContextFromMuxInbound(ctx)
-
-	// Create pipe for communication
-	pReader, pWriter := io.Pipe()
-
-	// Create session
-	sess := &tcpSession{
-		key:        key,
-		lastActive: time.Now(),
-	}
-	s.tcpSessions.Store(key, sess)
-
-	// Create link for dispatcher
-	link := &transport.Link{
-		Reader: buf.NewReader(pReader),
-		Writer: buf.NewWriter(pWriter),
+// processTCPv6 processes a TCP packet over IPv6
+func (s *SystemStack) processTCPv6(ipHdr IPv6Header, tcpHdr TCPHeader) bool {
+	if len(tcpHdr) < TCPMinHeaderSize {
+		return false
 	}
 
-	errors.LogInfo(ctx, "new TCP connection to ", dest)
-
-	// Dispatch to routing
-	if err := s.handler.dispatcher.DispatchLink(ctx, dest, link); err != nil {
-		errors.LogWarning(ctx, "dispatch error: ", err)
-		pReader.Close()
-		pWriter.Close()
-		s.tcpSessions.Delete(key)
-		return
+	if s.tcpListener6 == nil {
+		return false
 	}
 
-	errors.LogInfo(ctx, "TCP connection completed")
-	s.tcpSessions.Delete(key)
+	srcAddr := ipHdr.SourceAddr()
+	dstAddr := ipHdr.DestinationAddr()
+	srcPort := tcpHdr.SourcePort()
+	dstPort := tcpHdr.DestinationPort()
+
+	source := netip.AddrPortFrom(srcAddr, srcPort)
+	destination := netip.AddrPortFrom(dstAddr, dstPort)
+
+	// Check if this is a response from our local listener
+	if srcAddr == s.inet6Addr && srcPort == s.tcpPort6 {
+		session := s.tcpNat.LookupBack(dstPort)
+		if session == nil {
+			return false
+		}
+
+		ipHdr.SetSourceAddr(session.Destination.Addr())
+		tcpHdr.SetSourcePort(session.Destination.Port())
+		ipHdr.SetDestinationAddr(session.Source.Addr())
+		tcpHdr.SetDestinationPort(session.Source.Port())
+
+		s.recalcTCPv6Checksum(ipHdr, tcpHdr)
+		return true
+	}
+
+	// Handle FIN/RST
+	flags := tcpHdr.Flags()
+	if flags&(TCPFlagFIN|TCPFlagRST) != 0 {
+		s.tcpNat.Delete(source)
+	}
+
+	// Outgoing packet - apply NAT
+	natPort, _ := s.tcpNat.Lookup(source, destination)
+
+	ipHdr.SetSourceAddr(s.inet6Next)
+	tcpHdr.SetSourcePort(natPort)
+	ipHdr.SetDestinationAddr(s.inet6Addr)
+	tcpHdr.SetDestinationPort(s.tcpPort6)
+
+	s.recalcTCPv6Checksum(ipHdr, tcpHdr)
+	return true
 }
 
-// handleUDP processes UDP packets
-func (s *LightweightStack) handleUDP(srcIP, dstIP net.IP, udpData []byte, isIPv6 bool) {
-	if len(udpData) < udpHeaderLen {
+// processUDPv4 processes a UDP packet over IPv4
+func (s *SystemStack) processUDPv4(ipHdr IPv4Header, udpHdr UDPHeader) {
+	if len(udpHdr) < UDPHeaderSize {
 		return
 	}
 
-	srcPort := binary.BigEndian.Uint16(udpData[0:2])
-	dstPort := binary.BigEndian.Uint16(udpData[2:4])
-	length := binary.BigEndian.Uint16(udpData[4:6])
+	srcAddr := ipHdr.SourceAddr()
+	dstAddr := ipHdr.DestinationAddr()
+	srcPort := udpHdr.SourcePort()
+	dstPort := udpHdr.DestinationPort()
 
-	if int(length) < udpHeaderLen || len(udpData) < int(length) {
-		return
-	}
+	source := netip.AddrPortFrom(srcAddr, srcPort)
+	destination := netip.AddrPortFrom(dstAddr, dstPort)
 
-	payload := udpData[udpHeaderLen:length]
+	payload := udpHdr.Payload()
 	if len(payload) == 0 {
 		return
 	}
 
-	// Create session key
-	key := udpSessionKey{
-		srcPort: srcPort,
-		dstPort: dstPort,
-		isIPv6:  isIPv6,
+	_, isNew := s.udpNat.Lookup(source, destination)
+	if isNew {
+		// New UDP session - dispatch to handler
+		go s.handleUDPSession(source, destination, payload)
 	}
-	if isIPv6 {
-		copy(key.srcIP[:], srcIP.To16())
-		copy(key.dstIP[:], dstIP.To16())
-	} else {
-		copy(key.srcIP[:4], srcIP.To4())
-		copy(key.dstIP[:4], dstIP.To4())
-	}
+}
 
-	dest := xnet.UDPDestination(xnet.IPAddress(dstIP), xnet.Port(dstPort))
-
-	// Check for existing session
-	if sessVal, ok := s.udpSessions.Load(key); ok {
-		sess := sessVal.(*udpSession)
-		sess.lastActive = time.Now()
-		// Write payload to existing connection
-		if sess.conn != nil {
-			sess.conn.Write(payload)
-		}
+// processUDPv6 processes a UDP packet over IPv6
+func (s *SystemStack) processUDPv6(ipHdr IPv6Header, udpHdr UDPHeader) {
+	if len(udpHdr) < UDPHeaderSize {
 		return
 	}
 
-	// Create new UDP session
-	go s.handleNewUDPConnection(key, srcIP, srcPort, dest, payload)
+	srcAddr := ipHdr.SourceAddr()
+	dstAddr := ipHdr.DestinationAddr()
+	srcPort := udpHdr.SourcePort()
+	dstPort := udpHdr.DestinationPort()
+
+	source := netip.AddrPortFrom(srcAddr, srcPort)
+	destination := netip.AddrPortFrom(dstAddr, dstPort)
+
+	payload := udpHdr.Payload()
+	if len(payload) == 0 {
+		return
+	}
+
+	_, isNew := s.udpNat.Lookup(source, destination)
+	if isNew {
+		go s.handleUDPSession(source, destination, payload)
+	}
 }
 
-// handleNewUDPConnection creates a new UDP session
-func (s *LightweightStack) handleNewUDPConnection(key udpSessionKey, srcIP net.IP, srcPort uint16, dest xnet.Destination, initialPayload []byte) {
+// handleUDPSession handles a new UDP session
+func (s *SystemStack) handleUDPSession(source, destination netip.AddrPort, payload []byte) {
 	sid := session.NewID()
 	ctx := c.ContextWithID(s.ctx, sid)
 
-	// Setup inbound session
+	dest := xnet.UDPDestination(
+		xnet.IPAddress(destination.Addr().AsSlice()),
+		xnet.Port(destination.Port()),
+	)
+
 	inbound := session.Inbound{
 		Name:          "tun-ios",
 		CanSpliceCopy: 1,
-		Source:        xnet.UDPDestination(xnet.IPAddress(srcIP), xnet.Port(srcPort)),
+		Source:        xnet.UDPDestination(xnet.IPAddress(source.Addr().AsSlice()), xnet.Port(source.Port())),
 		User: &protocol.MemoryUser{
 			Level: s.handler.config.UserLevel,
 		},
 	}
 	ctx = session.ContextWithInbound(ctx, &inbound)
-	ctx = session.SubContextFromMuxInbound(ctx)
 
-	// Create pipe for communication
+	// Create a simple buffer with the payload
+	reader := buf.FromBytes(payload)
 	pReader, pWriter := io.Pipe()
 
-	// Store session
-	sess := &udpSession{
-		key:        key,
-		lastActive: time.Now(),
-	}
-	s.udpSessions.Store(key, sess)
-
-	// Write initial payload
-	go func() {
-		pWriter.Write(initialPayload)
-	}()
-
-	// Create link for dispatcher
 	link := &transport.Link{
 		Reader: buf.NewReader(pReader),
 		Writer: buf.NewWriter(pWriter),
 	}
 
-	errors.LogInfo(ctx, "new UDP connection to ", dest)
+	go func() {
+		pWriter.Write(reader.Bytes())
+		pWriter.Close()
+	}()
 
-	// Dispatch to routing
 	if err := s.handler.dispatcher.DispatchLink(ctx, dest, link); err != nil {
-		errors.LogWarning(ctx, "dispatch error: ", err)
+		errors.LogDebug(ctx, "UDP dispatch error: ", err)
 	}
-
-	pReader.Close()
-	pWriter.Close()
-	s.udpSessions.Delete(key)
 }
 
-// cleanupLoop periodically cleans up idle sessions
-func (s *LightweightStack) cleanupLoop() {
+// acceptLoop accepts connections from the local TCP listener
+func (s *SystemStack) acceptLoop(listener net.Listener, isIPv6 bool) {
 	defer s.wg.Done()
 
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
 	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			s.cleanup()
-			// Also trigger GC to keep memory low
-			debug.FreeOSMemory()
+		conn, err := listener.Accept()
+		if err != nil {
+			select {
+			case <-s.ctx.Done():
+				return
+			default:
+				continue
+			}
 		}
+
+		// Get the NAT port from the remote address
+		remoteAddr := conn.RemoteAddr().(*net.TCPAddr)
+		natPort := uint16(remoteAddr.Port)
+
+		// Lookup the original destination
+		natSession := s.tcpNat.LookupBack(natPort)
+		if natSession == nil {
+			errors.LogDebug(s.ctx, "TCP accept: no NAT session for port ", natPort)
+			conn.Close()
+			continue
+		}
+
+		// Dispatch to handler
+		dest := xnet.TCPDestination(
+			xnet.IPAddress(natSession.Destination.Addr().AsSlice()),
+			xnet.Port(natSession.Destination.Port()),
+		)
+
+		go s.handler.HandleConnection(conn, dest)
 	}
 }
 
-// cleanup removes idle sessions
-func (s *LightweightStack) cleanup() {
-	now := time.Now()
+// recalcTCPv4Checksum recalculates TCP and IPv4 checksums
+func (s *SystemStack) recalcTCPv4Checksum(ipHdr IPv4Header, tcpHdr TCPHeader) {
+	// Clear TCP checksum
+	tcpHdr.SetChecksum(0)
 
-	// Cleanup TCP sessions
-	s.tcpSessions.Range(func(k, v interface{}) bool {
-		sess := v.(*tcpSession)
-		sess.mu.Lock()
-		if now.Sub(sess.lastActive) > s.idleTimeout {
-			if sess.conn != nil && !sess.closed {
-				sess.conn.Close()
-				sess.closed = true
-			}
-			sess.mu.Unlock()
-			s.tcpSessions.Delete(k)
-			return true
-		}
-		sess.mu.Unlock()
-		return true
-	})
+	// Calculate pseudo-header checksum
+	pseudoSum := PseudoHeaderChecksum(
+		ProtocolTCP,
+		ipHdr.SourceAddrSlice(),
+		ipHdr.DestinationAddrSlice(),
+		ipHdr.PayloadLength(),
+	)
 
-	// Cleanup UDP sessions
-	s.udpSessions.Range(func(k, v interface{}) bool {
-		sess := v.(*udpSession)
-		if now.Sub(sess.lastActive) > s.idleTimeout {
-			if sess.conn != nil {
-				sess.conn.Close()
-			}
-			s.udpSessions.Delete(k)
-		}
-		return true
-	})
+	// Calculate full TCP checksum
+	fullChecksum := tcpHdr.CalculateChecksum(pseudoSum)
+	tcpHdr.SetChecksum(^fullChecksum)
+
+	// Recalculate IP header checksum
+	ipHdr.SetChecksum(0)
+	ipHdr.SetChecksum(^ipHdr.CalculateChecksum())
+}
+
+// recalcTCPv6Checksum recalculates TCP checksum for IPv6
+func (s *SystemStack) recalcTCPv6Checksum(ipHdr IPv6Header, tcpHdr TCPHeader) {
+	// Clear TCP checksum
+	tcpHdr.SetChecksum(0)
+
+	// Calculate pseudo-header checksum
+	pseudoSum := PseudoHeaderChecksum(
+		ProtocolTCP,
+		ipHdr.SourceAddrSlice(),
+		ipHdr.DestinationAddrSlice(),
+		ipHdr.PayloadLength(),
+	)
+
+	// Calculate full TCP checksum
+	fullChecksum := tcpHdr.CalculateChecksum(pseudoSum)
+	tcpHdr.SetChecksum(^fullChecksum)
 }
