@@ -10,10 +10,11 @@ import (
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -91,6 +92,9 @@ func (t *Handler) Init(ctx context.Context, pm policy.Manager, dispatcher routin
 
 // HandleConnection pass the connection coming from the ip stack to the routing dispatcher
 func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
+	// always close handled connection at the end, signaling the stack that we are done with it regardless of the result
+	defer conn.Close()
+
 	sid := session.NewID()
 	ctx := c.ContextWithID(t.ctx, sid)
 	errors.LogInfo(ctx, "processing connection from: ", conn.RemoteAddr())
@@ -106,12 +110,28 @@ func (t *Handler) HandleConnection(conn net.Conn, destination net.Destination) {
 	ctx = session.ContextWithInbound(ctx, &inbound)
 	ctx = session.SubContextFromMuxInbound(ctx)
 
-	link := &transport.Link{
-		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
-		Writer: buf.NewWriter(conn),
+	link, err := t.dispatcher.Dispatch(ctx, destination)
+	if err != nil {
+		errors.LogError(ctx, errors.New("connection failed").Base(err))
+		return
 	}
-	if err := t.dispatcher.DispatchLink(ctx, destination, link); err != nil {
-		errors.LogError(ctx, errors.New("connection closed").Base(err))
+
+	pm := t.policy()
+	ctx, cancel := context.WithCancel(ctx)
+	timer := signal.CancelAfterInactivity(ctx, cancel, pm.Timeouts.ConnectionIdle)
+	requestFunc := func() error {
+		defer timer.SetTimeout(pm.Timeouts.DownlinkOnly)
+		return buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(timer))
+	}
+	responseFunc := func() error {
+		defer timer.SetTimeout(pm.Timeouts.UplinkOnly)
+		return buf.Copy(buf.NewReader(conn), link.Writer, buf.UpdateActivity(timer))
+	}
+	responseDonePost := task.OnSuccess(responseFunc, task.Close(link.Writer))
+	if err := task.Run(ctx, requestFunc, responseDonePost); err != nil {
+		_ = common.Interrupt(link.Reader)
+		_ = common.Interrupt(link.Writer)
+		errors.LogInfo(ctx, errors.New("connection closed").Base(err))
 		return
 	}
 
